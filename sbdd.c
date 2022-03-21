@@ -17,7 +17,6 @@
 #include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/vmalloc.h>
-#include <linux/jiffies.h>
 #include <linux/moduleparam.h>
 #include <linux/spinlock_types.h>
 #ifdef BLK_MQ_MODE
@@ -133,8 +132,11 @@ static void sbdd_xfer_bio(struct bio *bio)
 
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 {
-	if (atomic_read(&__sbdd.deleting))
+	if (atomic_read(&__sbdd.deleting)) {
+		pr_err("unable to process bio while deleting\n");
+		bio_io_error(bio);
 		return BLK_STS_IOERR;
+	}
 
 	atomic_inc(&__sbdd.refs_cnt);
 
@@ -176,7 +178,7 @@ static int sbdd_create(void)
 	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
 
 	pr_info("allocating data\n");
-	__sbdd.data = vmalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
+	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
 	if (!__sbdd.data) {
 		pr_err("unable to alloc data\n");
 		return -ENOMEM;
@@ -256,12 +258,7 @@ static void sbdd_delete(void)
 {
 	atomic_set(&__sbdd.deleting, 1);
 
-	if (!wait_event_timeout(__sbdd.exitwait,
-	                        !atomic_read(&__sbdd.refs_cnt),
-	                        msecs_to_jiffies(1000))) {
-		pr_err("call sbdd_delete() failed, timed out\n");
-		return;
-	}
+	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
 
 	/* gd will be removed only after the last reference put */
 	if (__sbdd.gd) {
