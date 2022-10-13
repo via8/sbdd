@@ -4,8 +4,6 @@ Implementation of Linux Kernel 5.4.X simple block device.
 ## Build
 - regular:
 `$ make`
-- with blk_mq support:
-uncomment `ccflags-y += -DBLK_MQ_MODE` in `Kbuild`
 - with requests debug info:
 uncomment `CFLAGS_sbdd.o := -DDEBUG` in `Kbuild`
 
