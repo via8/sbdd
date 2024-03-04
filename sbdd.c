@@ -48,7 +48,7 @@ static unsigned long    __sbdd_capacity_mib = 100;
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
-	void *buff = page_address(bvec->bv_page) + bvec->bv_offset;
+	void *buff = kmap_atomic(bvec->bv_page) + bvec->bv_offset;
 	sector_t len = bvec->bv_len >> SBDD_SECTOR_SHIFT;
 	size_t offset;
 	size_t nbytes;
@@ -70,6 +70,7 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 
 	pr_debug("pos=%6llu len=%4llu %s\n", pos, len, dir ? "written" : "read");
 
+	kunmap_atomic(buff);
 	return len;
 }
 
@@ -92,7 +93,8 @@ static blk_status_t sbdd_queue_rq(struct blk_mq_hw_ctx *hctx,
 	if (atomic_read(&__sbdd.deleting))
 		return BLK_STS_IOERR;
 
-	atomic_inc(&__sbdd.refs_cnt);
+	if (!atomic_inc_not_zero(&__sbdd.refs_cnt))
+		return BLK_STS_IOERR;
 
 	blk_mq_start_request(bd->rq);
 	sbdd_xfer_rq(bd->rq);
@@ -133,12 +135,14 @@ static void sbdd_xfer_bio(struct bio *bio)
 static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
 {
 	if (atomic_read(&__sbdd.deleting)) {
-		pr_err("unable to process bio while deleting\n");
 		bio_io_error(bio);
 		return BLK_STS_IOERR;
 	}
 
-	atomic_inc(&__sbdd.refs_cnt);
+	if (!atomic_inc_not_zero(&__sbdd.refs_cnt)) {
+		bio_io_error(bio);
+		return BLK_STS_IOERR;
+	}
 
 	sbdd_xfer_bio(bio);
 	bio_endio(bio);
@@ -242,6 +246,7 @@ static int sbdd_create(void)
 	/* Represents name in /proc/partitions and /sys/block */
 	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
 	set_capacity(__sbdd.gd, __sbdd.capacity);
+	atomic_set(&__sbdd.refs_cnt, 1);
 
 	/*
 	Allocating gd does not make it available, add_disk() required.
@@ -257,7 +262,7 @@ static int sbdd_create(void)
 static void sbdd_delete(void)
 {
 	atomic_set(&__sbdd.deleting, 1);
-
+	atomic_dec_if_positive(&__sbdd.refs_cnt);
 	wait_event(__sbdd.exitwait, !atomic_read(&__sbdd.refs_cnt));
 
 	/* gd will be removed only after the last reference put */
