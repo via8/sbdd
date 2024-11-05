@@ -11,7 +11,6 @@
 #include <linux/numa.h>
 #include <linux/errno.h>
 #include <linux/types.h>
-#include <linux/genhd.h>
 #include <linux/blkdev.h>
 #include <linux/string.h>
 #include <linux/kernel.h>
@@ -20,10 +19,10 @@
 #include <linux/moduleparam.h>
 #include <linux/spinlock_types.h>
 
-#define SBDD_SECTOR_SHIFT      9
-#define SBDD_SECTOR_SIZE       (1 << SBDD_SECTOR_SHIFT)
-#define SBDD_MIB_SECTORS       (1 << (20 - SBDD_SECTOR_SHIFT))
-#define SBDD_NAME              "sbdd"
+#define SBDD_SECTOR_SHIFT       9
+#define SBDD_SECTOR_SIZE        (1 << SBDD_SECTOR_SHIFT)
+#define SBDD_MIB_SECTORS        (1 << (20 - SBDD_SECTOR_SHIFT))
+#define SBDD_NAME               "sbdd"
 
 struct sbdd {
 	wait_queue_head_t       exitwait;
@@ -33,12 +32,10 @@ struct sbdd {
 	sector_t                capacity;
 	u8                      *data;
 	struct gendisk          *gd;
-	struct request_queue    *q;
 };
 
-static struct sbdd      __sbdd;
-static int              __sbdd_major = 0;
-static unsigned long    __sbdd_capacity_mib = 100;
+static struct sbdd              __sbdd = { 0 };
+static unsigned long            __sbdd_capacity_mib = 100;
 
 static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 {
@@ -68,36 +65,36 @@ static sector_t sbdd_xfer(struct bio_vec* bvec, sector_t pos, int dir)
 	return len;
 }
 
-static void sbdd_xfer_bio(struct bio *bio)
+static void sbdd_submit_bio(struct bio *bio)
 {
 	struct bvec_iter iter;
 	struct bio_vec bvec;
-	int dir = bio_data_dir(bio);
-	sector_t pos = bio->bi_iter.bi_sector;
+	int dir;
+	sector_t pos;
 
-	bio_for_each_segment(bvec, bio, iter)
-		pos += sbdd_xfer(&bvec, pos, dir);
-}
+	bio = bio_split_to_limits(bio);
+	if (!bio)
+		return;
 
-static blk_qc_t sbdd_make_request(struct request_queue *q, struct bio *bio)
-{
 	if (atomic_read(&__sbdd.deleting)) {
 		bio_io_error(bio);
-		return BLK_STS_IOERR;
+		return;
 	}
 
 	if (!atomic_inc_not_zero(&__sbdd.refs_cnt)) {
 		bio_io_error(bio);
-		return BLK_STS_IOERR;
+		return;
 	}
 
-	sbdd_xfer_bio(bio);
+	dir = bio_data_dir(bio);
+	pos = bio->bi_iter.bi_sector;
+	bio_for_each_segment(bvec, bio, iter)
+		pos += sbdd_xfer(&bvec, pos, dir);
+
 	bio_endio(bio);
 
 	if (atomic_dec_and_test(&__sbdd.refs_cnt))
 		wake_up(&__sbdd.exitwait);
-
-	return BLK_STS_OK;
 }
 
 /*
@@ -106,27 +103,15 @@ the request() function associated with the request queue of the disk.
 */
 static struct block_device_operations const __sbdd_bdev_ops = {
 	.owner = THIS_MODULE,
+	.submit_bio = sbdd_submit_bio,
 };
 
 static int sbdd_create(void)
 {
 	int ret = 0;
 
-	/*
-	This call is somewhat redundant, but used anyways by tradition.
-	The number is to be displayed in /proc/devices (0 for auto).
-	*/
-	pr_info("registering blkdev\n");
-	__sbdd_major = register_blkdev(0, SBDD_NAME);
-	if (__sbdd_major < 0) {
-		pr_err("call register_blkdev() failed with %d\n", __sbdd_major);
-		return -EBUSY;
-	}
-
-	memset(&__sbdd, 0, sizeof(struct sbdd));
-	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
-
 	pr_info("allocating data\n");
+	__sbdd.capacity = (sector_t)__sbdd_capacity_mib * SBDD_MIB_SECTORS;
 	__sbdd.data = vzalloc(__sbdd.capacity << SBDD_SECTOR_SHIFT);
 	if (!__sbdd.data) {
 		pr_err("unable to alloc data\n");
@@ -136,38 +121,35 @@ static int sbdd_create(void)
 	spin_lock_init(&__sbdd.datalock);
 	init_waitqueue_head(&__sbdd.exitwait);
 
-	pr_info("allocating queue\n");
-	__sbdd.q = blk_alloc_queue(GFP_KERNEL);
-	if (!__sbdd.q) {
-		pr_err("call blk_alloc_queue() failed\n");
-		return -EINVAL;
+	pr_info("allocating disk\n");
+	__sbdd.gd = blk_alloc_disk(NUMA_NO_NODE);
+	if (IS_ERR(__sbdd.gd)) {
+		pr_err("blk_alloc_disk() failed\n");
+		ret = PTR_ERR(__sbdd.gd);
+		__sbdd.gd = NULL;
+		return ret;
 	}
-	blk_queue_make_request(__sbdd.q, sbdd_make_request);
 
 	/* Configure queue */
-	blk_queue_logical_block_size(__sbdd.q, SBDD_SECTOR_SIZE);
-
-	/* A disk must have at least one minor */
-	pr_info("allocating disk\n");
-	__sbdd.gd = alloc_disk(1);
+	blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
+	blk_queue_physical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
 
 	/* Configure gendisk */
-	__sbdd.gd->queue = __sbdd.q;
-	__sbdd.gd->major = __sbdd_major;
-	__sbdd.gd->first_minor = 0;
 	__sbdd.gd->fops = &__sbdd_bdev_ops;
-	/* Represents name in /proc/partitions and /sys/block */
+	__sbdd.gd->private_data = &__sbdd;
 	scnprintf(__sbdd.gd->disk_name, DISK_NAME_LEN, SBDD_NAME);
 	set_capacity(__sbdd.gd, __sbdd.capacity);
 	atomic_set(&__sbdd.refs_cnt, 1);
 
 	/*
-	Allocating gd does not make it available, add_disk() required.
+	Allocating gd does not make it available, add_disk() is required.
 	After this call, gd methods can be called at any time. Should not be
 	called before the driver is fully initialized and ready to process reqs.
 	*/
 	pr_info("adding disk\n");
-	add_disk(__sbdd.gd);
+	ret = add_disk(__sbdd.gd);
+	if (ret)
+		pr_err("add_disk() failed\n");
 
 	return ret;
 }
@@ -182,27 +164,12 @@ static void sbdd_delete(void)
 	if (__sbdd.gd) {
 		pr_info("deleting disk\n");
 		del_gendisk(__sbdd.gd);
-	}
-
-	if (__sbdd.q) {
-		pr_info("cleaning up queue\n");
-		blk_cleanup_queue(__sbdd.q);
-	}
-
-	if (__sbdd.gd)
 		put_disk(__sbdd.gd);
+	}
 
 	if (__sbdd.data) {
 		pr_info("freeing data\n");
 		vfree(__sbdd.data);
-	}
-
-	memset(&__sbdd, 0, sizeof(struct sbdd));
-
-	if (__sbdd_major > 0) {
-		pr_info("unregistering blkdev\n");
-		unregister_blkdev(__sbdd_major, SBDD_NAME);
-		__sbdd_major = 0;
 	}
 }
 
@@ -219,7 +186,7 @@ static int __init sbdd_init(void)
 	ret = sbdd_create();
 
 	if (ret) {
-		pr_warn("initialization failed\n");
+		pr_err("initialization failed\n");
 		sbdd_delete();
 	} else {
 		pr_info("initialization complete\n");
