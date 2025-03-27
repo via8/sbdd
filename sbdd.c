@@ -108,6 +108,11 @@ static struct block_device_operations const __sbdd_bdev_ops = {
 
 static int sbdd_create(void)
 {
+	/* Configure queue */
+	struct queue_limits limits = {
+		.logical_block_size = SBDD_SECTOR_SIZE,
+		.physical_block_size = SBDD_SECTOR_SIZE,
+	};
 	int ret = 0;
 
 	pr_info("allocating data\n");
@@ -122,17 +127,13 @@ static int sbdd_create(void)
 	init_waitqueue_head(&__sbdd.exitwait);
 
 	pr_info("allocating disk\n");
-	__sbdd.gd = blk_alloc_disk(NUMA_NO_NODE);
+	__sbdd.gd = blk_alloc_disk(&limits, NUMA_NO_NODE);
 	if (IS_ERR(__sbdd.gd)) {
 		pr_err("blk_alloc_disk() failed\n");
 		ret = PTR_ERR(__sbdd.gd);
 		__sbdd.gd = NULL;
 		return ret;
 	}
-
-	/* Configure queue */
-	blk_queue_logical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
-	blk_queue_physical_block_size(__sbdd.gd->queue, SBDD_SECTOR_SIZE);
 
 	/* Configure gendisk */
 	__sbdd.gd->fops = &__sbdd_bdev_ops;

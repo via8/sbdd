@@ -1,5 +1,5 @@
 # Simple Block Device Driver
-Implementation of Linux kernel 6.8.X simple block device.
+Implementation of Linux kernel 6.9.X simple block device.
 
 ## Build
 `make`
